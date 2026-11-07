@@ -1,6 +1,6 @@
-# Universal Agent Bridge
+# Nippr
 
-A local coordination ledger for Claude Code, Codex, Grok, Muse Code and Antigravity.
+Nippr is a local coordination ledger for Claude Code, Codex, Grok, Muse Code and Antigravity.
 Any agent can coordinate; tasks and worker reports survive coordinator handoffs.
 
 ## Components
