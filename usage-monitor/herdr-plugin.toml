@@ -1,0 +1,18 @@
+id = "local.usage-monitor"
+name = "Usage Monitor"
+version = "0.2.0"
+min_herdr_version = "0.9.5"
+description = "Local token usage, context and quota snapshots"
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "dashboard"
+title = "📊 Usage Monitor"
+placement = "overlay"
+command = ["python3", "monitor.py"]
+
+[[panes]]
+id = "bridge"
+title = "🧭 Bridge — Live Team"
+placement = "tab"
+command = ["python3", "bridge-board.py"]

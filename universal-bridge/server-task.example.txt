@@ -1,0 +1,5 @@
+Template only: replace this text with the user-approved server objective and acceptance criteria.
+Work only on the resources listed in your private Bridge assignment.
+Do not change shared interfaces without agreement with the coordinator.
+If another file is needed, report blocked and request a scope change.
+Report progress and exact checks through worker-report; final state is review.

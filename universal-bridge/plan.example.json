@@ -1,0 +1,22 @@
+{
+  "assignments": [
+    {
+      "title": "Implement isolated UI changes",
+      "role": "UI executor",
+      "assignee": "claude",
+      "resources": ["src/components/Feature.tsx"],
+      "session": "REPLACE_WITH_SESSION",
+      "pane": "REPLACE_WITH_CLAUDE_PANE",
+      "instructions_file": "ui-task.example.txt"
+    },
+    {
+      "title": "Implement independent server changes",
+      "role": "Server executor",
+      "assignee": "grok",
+      "resources": ["src/server/feature.py"],
+      "session": "REPLACE_WITH_SESSION",
+      "pane": "REPLACE_WITH_GROK_PANE",
+      "instructions_file": "server-task.example.txt"
+    }
+  ]
+}
