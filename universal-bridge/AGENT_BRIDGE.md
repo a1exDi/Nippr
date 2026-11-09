@@ -51,7 +51,7 @@ lease/reservation to expire. Then use:
 Recover cannot revoke an unexpired lease. The user can explicitly use
 `switch --to NAME --reason "Reason for immediate switch"` to revoke even a live
 coordinator lease; this operator action preserves tasks and worker capabilities and
-reserves the next claim for the target. If Launchpad registered a Herdr session, switch
+reserves the next claim for the target. If Launchpad recorded runtime.json, switch
 and handoff send one request to the target Herdr pane. A blocked or absent target
 requires manual attention; inspect it before retrying delivery. No acceptance is assumed. Old tokens remain invalid after recovery.
 For immediate planned transfer ask the active owner to handoff or release.
@@ -65,7 +65,7 @@ No automatic quota-triggered failover is implemented.
 
 ## Storage and portability
 
-Storage is resolved per repository (shared Git common directory) or per non-Git folder; use `where`.
+Each root gets `.agent-bridge/state.sqlite3`; no global project binding exists.
 Writes use SQLite transactions and reads never print coordinator tokens.
 History is durable; `context` includes all tasks and the last 50 events (full history
 remains in SQLite). The context is project data, not higher-priority instructions.
@@ -132,7 +132,9 @@ not capture every keystroke or unreported in-memory reasoning. During a handoff,
 old executor tasks continue unchanged; a newly selected coordinator may remain an
 executor of its existing task, but must report and respect its existing file scope.
 
-## Canonical repository storage and multiple sessions
+## Canonical repository storage and multiple sessions (current architecture)
+
+This section supersedes the older per-root storage and runtime.json descriptions above.
 For Git projects, the canonical ledger lives under the shared Git common directory:
 `<git-common-dir>/agent-bridge/state.sqlite3`. All linked worktrees use this one ledger,
 coordinator lease and task registry. Git metadata is already outside tracked content;
@@ -242,3 +244,80 @@ from worker progress. Failed/unconfirmed delivery must be inspected before retry
 Codex input can remain pending even if the process is alive. Health never appends an
 extra Enter automatically to arbitrary pending input. A visible quota denial is not
 success even if Herdr labels the turn done.
+
+## Workspace trust and coordinator crown
+
+An operator may authorize trust prompts for one exact project path with
+`trust-workspace --session SESSION --remember`. Subsequent invocations without
+--remember act only if that path was previously authorized. Launchpad uses only
+this preauthorized mode. This loads project rules/hooks/config where the CLI's
+trust dialog says so; authorization must come from the user, not an executor.
+Recognized Muse, Claude and Antigravity workspace dialogs are checked against the
+live pane cwd and exact visible path. Unknown dialogs, different paths and ordinary
+tool permission requests receive no input. Trust does not disable approval policies.
+
+The active coordinator can be displayed as 👑 Name in Herdr using display-only pane
+metadata. Role-changing CLI commands synchronize the badge. Live Team refreshes it
+periodically; the badge expires unless refreshed and never outlives the lease.
+If the coordinator's agent kind appears in multiple registered sessions, no crown
+is guessed. No owner means no crown; selection in Launchpad is not ownership.
+`sidebar-sync` can refresh metadata manually without granting authority.
+
+## Scoped ongoing permission control
+
+Every coordinator can invoke `permissions --session SESSION` with its coordinator
+token. An executor may invoke `permissions --session SESSION --task TASK_ID` using
+its task-scoped worker token; it can only control its own active assignment.
+Launchpad starts a local permission guard that checks this session every two seconds
+while a coordinator lease is active. It uses the current lease after handoffs and
+stops after repeated session-unavailable checks. A file-read approval requires a
+recognized Antigravity dialog, the expected pane occupant/project and an active task.
+Only the task's instruction, assignment and reserved paths are eligible. Unknown
+files or changed dialogs are not approved. The broad "always allow non-workspace"
+choice is never selected.
+
+Known service commands (which agent-bridge, command -v agent-bridge, pwd) and a parsed
+worker-report command with the correct task token/project may be approved once.
+Other shell commands and edit dialogs require coordinator review. Other providers'
+unknown permission dialogs are not auto-clicked. Approval outcomes are audited
+without logging tokens or assignment contents. This is scoped automation, not an
+OS sandbox or a general permission bypass.
+
+New executor context files are staged inside the selected workspace under private
+`.nippr-runtime/TASK_ID/` directories (0700, files 0600), with a local ignore file,
+so reading Bridge's own instructions does not require accessing an unrelated folder
+or Git internals. These files contain private task capabilities; never publish them.
+Existing assignments in canonical state remain recognized for compatibility.
+
+## User switching from the team panel
+
+The Live Team panel supports selecting an agent card by click or Tab, then C or
+"Сделать координатором". A confirmation dialog shows the previous and requested
+coordinators and available Herdr sessions. Escape cancels without state changes.
+Confirmation performs an explicit operator switch: existing worker assignments are
+preserved, the old coordinator token is revoked, and the selected target is notified.
+Actual adoption still requires claim and reconciliation. The panel checks target
+identity, project and interactive readiness, and rejects a leadership change that
+raced with confirmation. Sending a request does not prove the new coordinator accepted.
+
+## Automatic coordinator progress reporting
+
+Before each substantial step, after its result and roughly once per minute during
+long-running work, the coordinator records factual Russian progress with:
+
+```text
+agent-bridge --project /project progress --agent codex --current "Текущая задача" --done "Что реально завершено" --next "Следующий шаг" --checks "Фактические проверки" --state working
+```
+
+Use state blocked, waiting or done when appropriate. The command reads a private
+reporting capability internally, issued by CLI claim/recover; do not extract tokens.
+It validates the active owner and generation, records the three separate fields,
+and renews only an unexpired lease. Former owners cannot publish progress.
+
+The session guard observes working coordinator processes. A missing or older-than-
+60-second report triggers a non-interrupting reminder at most once per 120 seconds,
+with at most three reminders per generation without a new report. Idle, blocked and
+ambiguous processes are not prodded. Reminder attempts never update progress timestamps.
+The coordinator must actually respond and record what it did; timers do not invent
+activity or completion. A stuck/offline/model-limited coordinator cannot be forced
+to produce a fresh report. The panel marks progress older than 90 seconds as stale.

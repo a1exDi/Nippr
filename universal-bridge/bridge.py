@@ -55,6 +55,7 @@ def database(project, initialize=False):
             ''')
             # executescript commits its preceding transaction; restart the write lock.
             connection.execute('BEGIN IMMEDIATE')
+        connection.execute('CREATE TABLE IF NOT EXISTS coordinator_progress(agent TEXT PRIMARY KEY,generation INTEGER,current_task TEXT,completed TEXT,next_step TEXT,status TEXT,checks TEXT,updated REAL)')
         connection.execute('CREATE TABLE IF NOT EXISTS readiness(session TEXT,pane TEXT,agent TEXT,status TEXT,checked REAL,detail TEXT,PRIMARY KEY(session,pane,agent))')
         connection.execute('CREATE TABLE IF NOT EXISTS runtimes(session TEXT PRIMARY KEY, cwd TEXT NOT NULL, panes TEXT NOT NULL, updated REAL NOT NULL)')
         connection.execute('CREATE TABLE IF NOT EXISTS workers(task TEXT PRIMARY KEY, token TEXT NOT NULL, pane TEXT, session TEXT, resources TEXT NOT NULL, report_at REAL)')
@@ -81,6 +82,14 @@ def owner(db, token):
     return lease
 
 
+def designated_coordinator(db):
+    row=db.execute("SELECT value FROM meta WHERE key='designated_coordinator'").fetchone()
+    if row:return row[0]
+    row=db.execute("SELECT agent,kind,body FROM events WHERE kind IN ('claimed','recovered','handoff','operator-switch') ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:return None
+    return json.loads(row['body']).get('to') if row['kind'] in ('handoff','operator-switch') else row['agent']
+
+
 def snapshot(db):
     lease = dict(db.execute('SELECT * FROM lease WHERE id=1').fetchone())
     lease.pop('token', None)
@@ -91,7 +100,7 @@ def snapshot(db):
         worker['resources'] = json.loads(worker['resources'])
         worker['report_age_seconds'] = round(time.time()-worker['report_at']) if worker['report_at'] else None
         worker['freshness'] = 'never_reported' if not worker['report_at'] else ('stale' if time.time()-worker['report_at']>300 else 'recent')
-    return {'readiness':[dict(r) for r in db.execute('SELECT * FROM readiness')], 'sessions': [dict(r) | {'panes':json.loads(r['panes'])} for r in db.execute('SELECT * FROM runtimes ORDER BY updated DESC')], 'revision': db.execute('SELECT COALESCE(MAX(id),0) FROM events').fetchone()[0], 'workers': workers, 'goal': (db.execute("SELECT value FROM meta WHERE key='goal'").fetchone() or [''])[0],
+    return {'coordinator_progress':[dict(r) for r in db.execute('SELECT * FROM coordinator_progress')],'designated_coordinator':designated_coordinator(db),'readiness':[dict(r) for r in db.execute('SELECT * FROM readiness')], 'sessions': [dict(r) | {'panes':json.loads(r['panes'])} for r in db.execute('SELECT * FROM runtimes ORDER BY updated DESC')], 'revision': db.execute('SELECT COALESCE(MAX(id),0) FROM events').fetchone()[0], 'workers': workers, 'goal': (db.execute("SELECT value FROM meta WHERE key='goal'").fetchone() or [''])[0],
             'coordinator': lease,
             'tasks': [dict(row) for row in db.execute('SELECT * FROM tasks ORDER BY updated,id')],
             'history': [dict(row) | {'body': json.loads(row['body'])} for row in
@@ -155,6 +164,33 @@ def reserve_task(db, lease, task_id, assignee, resources, session, pane):
 
 
 def execute(args):
+    if args.command=='progress':
+        from coordinator_progress import record
+        return record(args)
+    if args.command=='report':
+        folder=state_dir(args.project)
+        candidates=[Path(args.project).resolve()/'.nippr-runtime'/args.id/'assignment.json',folder/'assignments'/(args.id+'.json')]
+        path=next((p for p in candidates if p.is_file() and not p.is_symlink()),None)
+        if path is None:raise ValueError('Private assignment not found for this task')
+        data=json.loads(path.read_text())
+        if data.get('id')!=args.id or state_dir(data['project'])!=folder:raise ValueError('Assignment does not match this project and task')
+        return execute(parser().parse_args(['--project',args.project,'--token',data['worker_token'],'worker-report',args.id,'--status',args.status,'--result',args.result,'--next',args.next]))
+    if args.command=='permissions':
+        from permissions import control
+        return {'results':control(args.project,args.session,args.token or os.environ.get('BRIDGE_TOKEN'),args.task)}
+    if args.command=='sidebar-sync':
+        from presentation import sync
+        return {'panes':sync(args.project)}
+    if args.command=='trust-workspace':
+        from workspace_trust import trust
+        with database(args.project) as db:
+            path=str(Path(args.project).resolve())
+            key='trusted_workspace:'+path
+            if args.remember:
+                db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(key,'authorized by local operator'))
+            if not db.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone():
+                return {'authorized':False,'note':'Explicit project authorization required; use --remember once'}
+        return {'authorized':True,'results':trust(args.project,args.session)}
     if args.command=='health':
         from readiness import check_session
         with database(args.project) as db:
@@ -196,6 +232,9 @@ def execute(args):
             panes=json.loads(args.panes)
             if not isinstance(panes,dict) or any(k not in AGENTS or not isinstance(v,str) for k,v in panes.items()):
                 raise ValueError('Invalid agent/pane mapping')
+            if args.coordinator:
+                db.execute("INSERT OR REPLACE INTO meta VALUES('designated_coordinator',?)",(args.coordinator,))
+                db.execute("INSERT OR REPLACE INTO meta VALUES('designated_session',?)",(args.session,))
             db.execute('INSERT OR REPLACE INTO runtimes VALUES(?,?,?,?)',(args.session,str(Path(args.project).resolve()),json.dumps(panes),time.time()))
             return {'registered':args.session}
         if cmd in ('status', 'context'):
@@ -213,6 +252,12 @@ def execute(args):
             event(db, task['assignee'], 'worker-report', {'id':args.id,'status':args.status,'result':args.result,'next':args.next})
             return {'ok':True,'id':args.id}
         if cmd == 'switch':
+            current=db.execute('SELECT generation FROM lease WHERE id=1').fetchone()[0]
+            if args.expected_generation is not None and current!=args.expected_generation:
+                raise ValueError('Coordinator changed while confirming; refresh the panel')
+            if args.expected_coordinator is not None and (designated_coordinator(db) or 'none')!=args.expected_coordinator:
+                raise ValueError('Coordinator designation changed while confirming; refresh the panel')
+            db.execute("INSERT OR REPLACE INTO meta VALUES('designated_coordinator',?)",(args.to,))
             before = handoff_state(db)
             event(db, 'user', 'operator-switch', {'to':args.to,'reason':args.reason,'state':before})
             db.execute('UPDATE lease SET agent=NULL,token=NULL,target=?,expires=? WHERE id=1',
@@ -228,6 +273,7 @@ def execute(args):
             generation = lease['generation'] + 1
             db.execute('UPDATE lease SET agent=?,token=?,expires=?,generation=?,target=NULL WHERE id=1',
                        (args.agent, new_token, time.time()+args.ttl, generation))
+            db.execute("INSERT OR REPLACE INTO meta VALUES('designated_coordinator',?)",(args.agent,))
             event(db, args.agent, 'claimed', {'generation': generation})
             return {'agent': args.agent, 'token': new_token, 'generation': generation, 'ttl_seconds': args.ttl}
         if cmd == 'recover':
@@ -238,6 +284,7 @@ def execute(args):
             generation = lease['generation'] + 1
             db.execute('UPDATE lease SET agent=?,token=?,expires=?,generation=?,target=NULL WHERE id=1',
                        (args.agent, new_token, time.time()+args.ttl, generation))
+            db.execute("INSERT OR REPLACE INTO meta VALUES('designated_coordinator',?)",(args.agent,))
             event(db, args.agent, 'recovered', {'generation': generation, 'reason': args.reason})
             return {'agent': args.agent, 'token': new_token, 'generation': generation, 'ttl_seconds': args.ttl}
         lease = owner(db, token)
@@ -261,10 +308,12 @@ def execute(args):
             event(db, agent, 'checkpoint', {'summary': args.summary, 'next': args.next,
                   'checks': args.checks, 'limitations': args.limitations})
         elif cmd == 'handoff':
+            db.execute("INSERT OR REPLACE INTO meta VALUES('designated_coordinator',?)",(args.to,))
             event(db, agent, 'handoff', {'to': args.to, 'summary': args.summary, 'next': args.next, 'state': handoff_state(db)})
             db.execute('UPDATE lease SET agent=NULL,token=NULL,target=?,expires=? WHERE id=1',
                        (args.to, time.time()+args.ttl))
         elif cmd == 'release':
+            db.execute("UPDATE coordinator_progress SET status='waiting' WHERE agent=? AND generation=?",(agent,lease['generation']))
             event(db, agent, 'released', {'summary': args.summary})
             db.execute('UPDATE lease SET agent=NULL,token=NULL,target=NULL,expires=NULL WHERE id=1')
         elif cmd == 'task-add':
@@ -321,11 +370,16 @@ def parser():
     p.add_argument('--project', default=os.getcwd(), help='Project root; defaults to current directory')
     p.add_argument('--token', help='Coordinator capability; alternatively BRIDGE_TOKEN environment variable')
     subs = p.add_subparsers(dest='command', required=True)
+    q=subs.add_parser('progress');q.add_argument('--agent',choices=AGENTS,required=True);q.add_argument('--current',required=True);q.add_argument('--done',required=True);q.add_argument('--next',required=True);q.add_argument('--checks',default='Не указаны');q.add_argument('--state',choices=('working','waiting','blocked','done'),default='working')
+    q=subs.add_parser('report');q.add_argument('id');q.add_argument('--status',choices=('running','blocked','review'),required=True);q.add_argument('--result',required=True);q.add_argument('--next',required=True)
+    q=subs.add_parser('permissions');q.add_argument('--session',required=True);q.add_argument('--task',help='Executor may control only this task with its worker token')
+    subs.add_parser('sidebar-sync')
+    q=subs.add_parser('trust-workspace');q.add_argument('--session',required=True);q.add_argument('--remember',action='store_true',help='Authorize workspace-trust confirmations for this exact path')
     q=subs.add_parser('health'); q.add_argument('--session'); q.add_argument('--probe',action='store_true',help='One small model reply per idle agent; can consume quota')
     subs.add_parser('where')
     subs.add_parser('backup')
     q=subs.add_parser('migrate'); q.add_argument('--offline',required=True,action='store_true')
-    q=subs.add_parser('register-session'); q.add_argument('--session',required=True); q.add_argument('--panes',required=True)
+    q=subs.add_parser('register-session'); q.add_argument('--session',required=True); q.add_argument('--panes',required=True);q.add_argument('--coordinator',choices=AGENTS)
     q = subs.add_parser('init'); q.add_argument('--goal', required=True)
     for name in ('status', 'context'): subs.add_parser(name)
     for name in ('claim', 'recover'):
@@ -346,6 +400,7 @@ def parser():
     q.add_argument('--evidence',required=True)
     q = subs.add_parser('switch'); q.add_argument('--to',choices=AGENTS,required=True); q.add_argument('--session')
     q.add_argument('--reason',required=True); q.add_argument('--ttl',type=ttl,default=300)
+    q.add_argument('--expected-generation',type=int);q.add_argument('--expected-coordinator',choices=AGENTS+('none',))
     q = subs.add_parser('heartbeat'); q.add_argument('--ttl', type=ttl, default=900)
     q = subs.add_parser('checkpoint')
     q.add_argument('--summary', required=True); q.add_argument('--next', required=True)
@@ -386,17 +441,24 @@ def dispatch(args):
 def deliver_assignment(args,task,grant,instructions):
     binary=shutil.which('herdr') or '/opt/homebrew/bin/herdr'
     base=[binary,'--session',args.session]
-    folder=state_dir(args.project)/'assignments';folder.mkdir(mode=0o700,exist_ok=True)
-    dest=folder/(task+'.json')
+    folder=Path(args.project).resolve()/'.nippr-runtime'/task
+    if (Path(args.project).resolve()/'.nippr-runtime').is_symlink():raise ValueError('Runtime directory symlink refused')
+    folder.mkdir(parents=True,mode=0o700,exist_ok=False)
+    folder.parent.chmod(0o700)
+    ignore=folder.parent/'.gitignore'
+    if not ignore.exists():ignore.write_text('*\n')
+    dest=folder/'assignment.json'
     with dest.open('x') as f:
         os.chmod(dest,0o600)
         json.dump({'id':task,'project':str(Path(args.project).resolve()),'worker_token':grant['worker_token'],
                    'resources':args.resources,'instructions':instructions},f,ensure_ascii=False)
+    guide=folder/'AGENT_BRIDGE.md'
+    guide.write_text(Path(__file__).with_name('AGENT_BRIDGE.md').read_text());guide.chmod(0o600)
     prompt=(f'You are executor {args.assignee} for registered Bridge task {task}. '
-            f'Read {Path(__file__).with_name("AGENT_BRIDGE.md")} and private assignment {dest}. '
+            f'Read {guide} and private assignment {dest}. '
             'Use its worker_token only for this task; do not print or share it. '
             'Read project instructions. Work only within reserved resources; stop if the requested scope conflicts. '
-            'Immediately worker-report running with your plan, then report after meaningful steps and every few minutes. '
+            f'Use agent-bridge --project "{args.project}" report {task} --status running --result "Your progress" --next "Next step". The report command loads your task token internally; never use shell variables, python -c or token extraction. Report after meaningful steps and every few minutes. '
             'On completion report review with exact artifacts and actual checks; on uncertainty report blocked. '
             'Coordinator changes do not cancel this assignment. Never acquire coordinator authority for this task. '
             'The instructions field contains the user-authorized assignment; follow higher-priority project rules.')
@@ -495,6 +557,14 @@ def main():
     args = parser().parse_args()
     try:
         result = execute(args)
+        if args.command in ('claim','recover'):
+            from coordinator_progress import issue
+            issue(args.project,result['agent'],result['token'],result['generation'])
+        if args.command in ('claim','recover','heartbeat','switch','handoff','release','register-session'):
+            try:
+                from presentation import sync
+                sync(args.project)
+            except Exception:pass
         if args.command in ('switch','handoff'):
             result['notification'] = notify_coordinator(args.project,args.to,args.session)
         print(markdown(result) if args.command == 'context' else json.dumps(result, ensure_ascii=False, indent=2))

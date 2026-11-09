@@ -200,104 +200,143 @@ def window_details(record):
     return result
 
 
+def monitor_project():
+    value=os.environ.get('BRIDGE_PROJECT')
+    if value:return Path(value).expanduser().resolve()
+    try:
+        binary=__import__('shutil').which('herdr') or '/opt/homebrew/bin/herdr'
+        response=__import__('subprocess').run([binary,'agent','list'],capture_output=True,text=True,timeout=3)
+        agents=json.loads(response.stdout)['result']['agents']
+        roots={a.get('cwd') for a in agents if a.get('cwd')}
+        if len(roots)==1:return Path(roots.pop()).resolve()
+    except Exception:pass
+    return None
+
+
+def monitor_leader(project):
+    if not project:return None
+    try:
+        import sys,sqlite3
+        sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'universal-bridge'))
+        from project_store import state_dir
+        from bridge import designated_coordinator
+        with sqlite3.connect((state_dir(project)/'state.sqlite3').as_uri()+'?mode=ro',uri=True) as db:
+            db.row_factory=sqlite3.Row
+            return designated_coordinator(db)
+    except Exception:return None
+
+
+def usage_card(name,record):
+    record=record or {}
+    rows=[('Тариф: '+(record.get('plan') or 'источник не сообщает'),True),
+          ('Модель: '+(record.get('model') or 'не передана источником'),False),('',False)]
+    windows=all_windows(record)
+    if windows:
+        for label,used,reset in windows:
+            rows.extend([(label,True),(progress(used,18)+' использовано · сброс '+reset,False)])
+    else:rows.append(('Квоты: нет подтверждённых данных',False))
+    rows.extend([('',False),('ТОКЕНЫ СЕССИИ',True),
+        ('Вход '+fmt(record.get('input'))+'   Выход '+fmt(record.get('output'))+'   Кеш '+fmt(record.get('cached')),False)])
+    if name=='Claude':rows.append(('Кеш указан для последнего запроса',False))
+    if number(record.get('context_pct')):
+        rows.append(('Контекст: '+progress(record['context_pct'],14)+' · окно '+fmt(record.get('context_size')),False))
+    elif number(record.get('context_observed')):
+        rows.append(('Последний запрос '+fmt(record['context_observed'])+' / окно '+fmt(record.get('context_size')),False))
+        rows.append(('Это снимок запроса, не точный остаток контекста',False))
+    else:rows.append(('Контекст: источник не сообщает',False))
+    rows.append(('Стоимость: '+(f"${record['cost']:.4f}" if number(record.get('cost')) else 'не передана'),False))
+    raw=record.get('quota_updated') or record.get('updated')
+    try:
+        parsed=dt.datetime.fromisoformat(raw.replace('Z','+00:00'))
+        stamp=parsed.astimezone().strftime('%d.%m %H:%M:%S')
+        elapsed=(dt.datetime.now(dt.timezone.utc)-parsed).total_seconds()
+        if elapsed>300:stamp+=' · устарело'
+    except (ValueError,AttributeError,TypeError):stamp='ещё нет обновлений'
+    source=record.get('quota_source') or record.get('source') or 'не подключён'
+    if source.startswith('/'):source='Локальный журнал '+name
+    rows.extend([('',False),('Квоты обновлены: '+stamp,False),('Источник: '+source,False)])
+    if record.get('error'):rows.append(('ВНИМАНИЕ: '+record['error'],True))
+    return rows
+
+
 def dashboard(screen):
-    screen.keypad(True)
-    screen.timeout(400)
-    color = 0
+    import textwrap
+    screen.keypad(True);screen.timeout(400)
+    palette={name:0 for name in NAMES}
     if curses.has_colors():
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN, -1)
-        color = curses.color_pair(1)
-        curses.init_pair(2, -1, -1)
-        screen.bkgd(' ', curses.color_pair(2))
-    try: curses.curs_set(0)
-    except curses.error: pass
-    current, offset = 0, 0
-    records = snapshots()
-    refreshed, next_live = 0, 0
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = None
+        curses.start_color();curses.use_default_colors()
+        colors=[81,213,114,215,111] if curses.COLORS>=256 else [curses.COLOR_CYAN,curses.COLOR_MAGENTA,curses.COLOR_GREEN,curses.COLOR_YELLOW,curses.COLOR_BLUE]
+        for i,(name,fg) in enumerate(zip(NAMES,colors),1):
+            curses.init_pair(i,fg,-1);palette[name]=curses.color_pair(i)
+        curses.init_pair(6,-1,-1);screen.bkgd(' ',curses.color_pair(6))
+    try:curses.curs_set(0)
+    except curses.error:pass
+    offset=0;records=snapshots();refreshed=float('-inf');next_live=0
+    project=monitor_project();leader=None;leader_at=float('-inf')
+    pool=concurrent.futures.ThreadPoolExecutor(max_workers=1);future=None
     try:
         while True:
-            clock = time.monotonic()
+            clock=time.monotonic()
             if future is not None and future.done():
-                try: future.result()
-                except Exception: pass
-                future = None
-                refreshed = 0
-            if clock >= next_live and future is None:
-                future = pool.submit(refresh_live)
-                next_live = clock + 120
-            if clock-refreshed > 5:
-                records = snapshots()
-                refreshed = clock
-            screen.erase()
-            h,w = screen.getmaxyx()
+                try:future.result()
+                except Exception:pass
+                future=None;refreshed=float('-inf')
+            if clock>=next_live and future is None:future=pool.submit(refresh_live);next_live=clock+120
+            if clock-refreshed>5:records=snapshots();refreshed=clock
+            if clock-leader_at>2:leader=monitor_leader(project);leader_at=clock
+            order=sorted(NAMES,key=lambda name:0 if name.lower()==leader else 1)
+            h,w=screen.getmaxyx();screen.erase()
             def put(y,x,text,attr=0,limit=None):
-                if not (0 <= y < h-1 and 0 <= x < w-1): return
-                budget = min(w-x-1, limit if limit is not None else w)
-                out, size = '', 0
+                if not (0<=y<h-1 and 0<=x<w-1):return
+                budget=min(w-x-1,limit if limit is not None else w);out='';used=0
                 for ch in str(text):
-                    n = 0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in 'WF' else 1)
-                    if size+n > budget: break
-                    out += ch; size += n
-                try: screen.addstr(y,x,out,attr)
-                except curses.error: pass
-            def box(y,x,height,width,title):
-                put(y,x,'╭'+'─'*(width-2)+'╮',color)
-                for yy in range(y+1,y+height-1):
-                    put(yy,x,'│',color);put(yy,x+width-1,'│',color)
-                put(y+height-1,x,'╰'+'─'*(width-2)+'╯',color)
-                put(y,x+2,' '+title+' ',color|curses.A_BOLD,width-4)
-            if w < 76 or h < 24:
-                put(2,2,'Разверни терминал минимум до 76 × 24. Q — выход.')
+                    size=0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in 'WF' else 1)
+                    if used+size>budget:break
+                    out+=ch;used+=size
+                try:screen.addstr(y,x,out,attr)
+                except curses.error:pass
+            accent=palette['Codex']
+            put(1,3,'N I P P R   /   КВОТЫ И РАСХОД',accent|curses.A_BOLD)
+            put(2,3,('Проект: '+project.name+' · ' if project else '')+'Все агенты на одной странице',curses.A_DIM)
+            put(4,3,'Полосы показывают ИСПОЛЬЗОВАНО: 0% свободно → 100% квота исчерпана')
+            put(5,3,'Обновляю источники…' if future else 'Опрос сервисов: 2 минуты · локальные данные: 5 секунд',curses.A_DIM)
+            if w<64 or h<22:put(8,3,'Разверни терминал хотя бы до 64 × 22.')
             else:
-                put(1,3,'📊  USAGE MONITOR   /   AI ACCOUNTS',color|curses.A_BOLD)
-                put(3,3,'0% — квота не израсходована     100% — квота исчерпана')
-                put(4,3,'Обновляю сервисы…' if future else 'Квоты: опрос раз в 2 минуты · локальные счётчики: раз в 5 секунд',curses.A_DIM)
-                left = min(53, max(32, int(w*.42)))
-                right = w-left-6
-                ph = h-9
-                box(6,2,ph,left,'🤖 Агенты и тарифы')
-                box(6,left+4,ph,right,'✦ '+NAMES[current]+' / Подробности')
-                step = 7 if ph >= 38 else (6 if ph >= 33 else (5 if ph>=28 else 4))
-                capacity = max(1,(ph-2)//step)
-                start = max(0,current-capacity+1)
-                for pos in range(start,min(len(NAMES),start+capacity)):
-                    name=NAMES[pos];record=records.get(name) or {}
-                    yy=8+(pos-start)*step
-                    attr=color|curses.A_BOLD if pos==current else curses.A_BOLD
-                    put(yy,4,('› ' if pos==current else '  ')+name,attr,left-4)
-                    put(yy+1,6,'Тариф: '+(record.get('plan') or 'не сообщается'),curses.A_DIM,left-6)
-                    windows=all_windows(record)
-                    if name=='Antigravity':
-                        put(yy+2,6,'Лимиты внутри Antigravity:',0,left-6)
-                        if step>=5: put(yy+3,6,'Gemini; Claude и GPT',0,left-6)
-                        if step>=6: put(yy+4,6,'Все полосы — справа →',curses.A_DIM,left-6)
-                    elif windows:
-                        for n,(label,used,_) in enumerate(windows[:max(1,step-3)]):
-                            put(yy+2+n,6,label+' '+progress(used,10 if left>=46 else 8),0,left-6)
-                    else: put(yy+2,6,'Квота: нет данных',curses.A_DIM,left-6)
-                import textwrap
-                content=[part for line in details(NAMES[current],records.get(NAMES[current]))
-                         for part in (textwrap.wrap(line,max(10,right-4),break_long_words=True) or [''])]
-                count=ph-3
-                offset=min(offset,max(0,len(content)-count))
-                for n,text in enumerate(content[offset:offset+count]):
-                    put(8+n,left+6,text,0,right-4)
-                if len(content)>count: put(h-4,left+6,'PgUp / PgDn — прокрутить подробности',curses.A_DIM,right-4)
-                put(h-2,3,'↑↓ Агент   R Обновить квоты   PgUp/PgDn Детали   Q / Esc Закрыть',color)
-            screen.refresh()
-            key=screen.getch()
-            if key in (ord('q'),ord('Q'),27): return
-            if key==curses.KEY_UP: current=max(0,current-1);offset=0
-            if key==curses.KEY_DOWN: current=min(len(NAMES)-1,current+1);offset=0
-            if key==curses.KEY_NPAGE: offset+=5
-            if key==curses.KEY_PPAGE: offset=max(0,offset-5)
-            if key in (ord('r'),ord('R')): refreshed=0;next_live=0
-    finally:
-        pool.shutdown(wait=False)
+                top=7;bottom=h-4;area=bottom-top
+                columns=3 if w>=200 else (2 if w>=132 else 1)
+                gap=2;width=(w-4-gap*(columns-1))//columns
+                rendered=[]
+                for name in order:
+                    lines=[(part,bold) for line,bold in usage_card(name,records.get(name))
+                           for part in (textwrap.wrap(line,max(10,width-6)) or [''])]
+                    rendered.append((name,lines))
+                row_heights=[max(len(lines)+3 for _,lines in rendered[i:i+columns]) for i in range(0,len(rendered),columns)]
+                total=sum(height+1 for height in row_heights)
+                offset=min(offset,max(0,total-area))
+                def vp(y,x,text,attr=0,limit=None):
+                    if top<=y<bottom:put(y,x,text,attr,limit)
+                y=top-offset
+                for group,rowheight in zip(range(0,len(rendered),columns),row_heights):
+                    for pos,(name,lines) in enumerate(rendered[group:group+columns]):
+                        x=2+pos*(width+gap);color=palette[name]
+                        vp(y,x,'╭'+'─'*(width-2)+'╮',color)
+                        for yy in range(y+1,y+rowheight-1):vp(yy,x,'│',color);vp(yy,x+width-1,'│',color)
+                        vp(y+rowheight-1,x,'╰'+'─'*(width-2)+'╯',color)
+                        title=('👑 ' if name.lower()==leader else '')+name+(' · Координатор' if name.lower()==leader else '')
+                        vp(y,x+2,' '+title+' ',color|curses.A_BOLD,width-5)
+                        for n,(line,bold) in enumerate(lines):vp(y+1+n,x+3,line,curses.A_BOLD if bold else 0,width-6)
+                    y+=rowheight+1
+                put(h-3,3,'Токены — из последней локальной сессии; квоты — снимки источников, не общий баланс.',curses.A_DIM)
+            put(h-2,3,'↑↓ / PgUp PgDn Прокрутка страницы · R Обновить · Q / Esc Закрыть',accent)
+            screen.refresh();key=screen.getch()
+            if key in (ord('q'),ord('Q'),27):return
+            if key==curses.KEY_UP:offset=max(0,offset-1)
+            if key==curses.KEY_DOWN:offset+=1
+            if key==curses.KEY_NPAGE:offset+=10
+            if key==curses.KEY_PPAGE:offset=max(0,offset-10)
+            if key in (ord('r'),ord('R')):refreshed=float('-inf');next_live=0
+    finally:pool.shutdown(wait=False)
+
 
 
 if __name__=='__main__':

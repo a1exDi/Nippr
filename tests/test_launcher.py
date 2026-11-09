@@ -16,7 +16,7 @@ def run(args, **kwargs):
         result={'pane':{'pane_id':f'w1:p{len(commands)}'}}
     return types.SimpleNamespace(returncode=0,stdout=json.dumps({'result':result}),stderr='')
 class StopExec(Exception): pass
-with patch.object(m,'bind_runtime'), patch.object(m,'prepare_bridge',return_value='Bootstrap'), patch.object(m,'projects',return_value=[Path.cwd()]), patch.object(m.curses,'wrapper',return_value=(Path.cwd(),m.AGENTS,'claude')), patch.object(m.shutil,'which',return_value='/mock/herdr'), patch.object(m.subprocess,'run',side_effect=run), patch.object(m.subprocess,'Popen'), patch.object(m.os,'execv',side_effect=StopExec), patch.object(m.os,'chdir'), patch.object(m.Path,'open', __import__('unittest.mock',fromlist=['mock_open']).mock_open()):
+with patch.object(m,'recent_sessions',return_value=[]), patch.object(m,'bind_runtime'), patch.object(m,'prepare_bridge',return_value='Bootstrap'), patch.object(m,'projects',return_value=[Path.cwd()]), patch.object(m.curses,'wrapper',return_value=(Path.cwd(),m.AGENTS,'claude')), patch.object(m.shutil,'which',return_value='/mock/herdr'), patch.object(m.subprocess,'run',side_effect=run), patch.object(m.subprocess,'Popen'), patch.object(m.os,'execv',side_effect=StopExec), patch.object(m.os,'chdir'), patch.object(m.Path,'open', __import__('unittest.mock',fromlist=['mock_open']).mock_open()):
     try: m.main()
     except StopExec: pass
 assert not [x for x in commands if 'start' in x], 'Must attach without waiting for agents'

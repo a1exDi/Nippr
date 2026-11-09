@@ -36,7 +36,9 @@ with tempfile.TemporaryDirectory() as temp:
  assert result['delivered']
  private=json.loads(Path(result['assignment_file']).read_text())
  assert 'worker_token' in private and 'worker_token' not in result
- assert any('worker-report' in str(call) for call in calls)
+ prompts=[call[-1] for call in calls if 'prompt' in call]
+ assert any(f'report {result["id"]} --status running' in prompt for prompt in prompts)
+ assert all(private['worker_token'] not in prompt for prompt in prompts)
  print('PASS: shared worktree ownership, multiple sessions, consistent backup, registered dispatch and private worker assignment')
 with tempfile.TemporaryDirectory() as temp:
  root=(Path(temp)/'repo').resolve();root.mkdir()

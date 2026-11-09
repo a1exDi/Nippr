@@ -41,11 +41,63 @@ def projects():
     return sorted(found, key=lambda p: str(p).lower())
 
 
+def recent_sessions(executable):
+    """Read Herdr's registry; never start a server during discovery."""
+    result = subprocess.run([executable, 'session', 'list', '--json'],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'Не удалось получить список сессий')
+    sessions = []
+    for entry in json.loads(result.stdout).get('sessions', []):
+        name = entry.get('name')
+        if not isinstance(name, str) or not name:
+            continue
+        snapshot = Path(entry['session_dir']) / 'session.json'
+        workspaces, updated = [], 0
+        try:
+            data = json.loads(snapshot.read_text())
+            workspaces = data.get('workspaces', [])
+            updated = snapshot.stat().st_mtime
+        except (OSError, ValueError):
+            pass
+        titles = [w.get('custom_name') or Path(w.get('identity_cwd') or '').name
+                  for w in workspaces if isinstance(w, dict)]
+        sessions.append(dict(name=name, running=bool(entry.get('running')),
+                             project=', '.join(t for t in titles if t) or name,
+                             updated=updated))
+    return sorted(sessions, key=lambda item: (item['updated'], item['name']), reverse=True)[:20]
+
+
+def session_label(item):
+    stamp = time.strftime('%d.%m %H:%M', time.localtime(item['updated'])) if item['updated'] else 'дата неизвестна'
+    status = 'Работает' if item['running'] else 'Остановлена'
+    return f"{item['project']} · {status} · {stamp} · {item['name']}"
+
+
+def choose_launch(screen, paths, sessions):
+    if sessions:
+        while True:
+            index = menu(screen, 'Последние сессии',
+                         [session_label(item) for item in sessions] + ['＋ Новая сессия'],
+                         sessions=True)
+            if index < len(sessions):
+                return sessions[index]['name']
+            try:
+                return choose(screen, paths)
+            except BackToSessions:
+                continue
+    return choose(screen, paths)
+
+
+class BackToSessions(Exception):
+    pass
+
+
 class BackToProjects(Exception):
     pass
 
 
-def menu(screen, title, options, multiple=False, project=None, coordinator=False):
+def menu(screen, title, options, multiple=False, project=None, coordinator=False, sessions=False):
     import textwrap
     import unicodedata
     screen.keypad(True)
@@ -100,15 +152,15 @@ def menu(screen, title, options, multiple=False, project=None, coordinator=False
                 raise KeyboardInterrupt
             continue
         put(1, 3, '🐑  H E R D R   /   LAUNCHPAD', colors[1] | curses.A_BOLD)
-        put(3, 3, '① Проект   →   ② Команда   →   ③ Координатор', curses.A_BOLD)
-        put(4, 3, 'Выбери, кто будет управлять проектом' if coordinator else ('Собери команду для проекта' if multiple else 'Выбери, над чем будем работать'), colors[4])
+        put(3, 3, 'Последние сессии — продолжить работу' if sessions else '① Проект   →   ② Команда   →   ③ Координатор', curses.A_BOLD)
+        put(4, 3, 'Выбери сессию или создай новую' if sessions else 'Выбери, кто будет управлять проектом' if coordinator else ('Собери команду для проекта' if multiple else 'Выбери, над чем будем работать'), colors[4])
         top, panel_h = 6, height - 11
         left_w = int((width - 6) * .60) if width >= 96 else width - 4
         right_x = left_w + 3
         row_step = 3 if height >= 28 else 2
         capacity = max(1, (panel_h - 4) // row_step)
         start = max(0, current - capacity + 1)
-        box(top, 2, panel_h, left_w, '👑 Координатор' if coordinator else ('🤖 Агенты' if multiple else '📁 Проекты'))
+        box(top, 2, panel_h, left_w, '↩ Последние сессии' if sessions else '👑 Координатор' if coordinator else ('🤖 Агенты' if multiple else '📁 Проекты'))
         put(top + 1, 4, f'Выбрано: {len(selected)} / {len(options)}    [A] Все' if multiple else '⌕ Поиск: ' + (query or 'начни печатать…'), colors[1], left_w - 4)
         hits = []
         for pos in range(start, min(len(visible), start + capacity)):
@@ -116,11 +168,11 @@ def menu(screen, title, options, multiple=False, project=None, coordinator=False
             y = top + 3 + (pos - start) * row_step
             attr = colors[2] | curses.A_BOLD if pos == current else 0
             put(y, 4, ' ' * (left_w - 4), attr)
-            text = options[index] if multiple or coordinator else Path(options[index]).name
+            text = options[index] if multiple or coordinator or sessions else Path(options[index]).name
             prefix = ('☑ ' if index in selected else '☐ ') + icons[index % len(icons)] + '  ' if multiple else ('👑  ' if coordinator else '📁  ')
             put(y, 5, prefix + text, attr, left_w - 6)
             if row_step == 3:
-                detail = 'Управление проектом через Bridge' if coordinator else ('Готов к запуску в отдельной панели' if multiple else str(Path(options[index]).parent).replace(str(Path.home()), '~', 1))
+                detail = 'Enter — открыть выбранную сессию' if sessions else 'Управление проектом через Bridge' if coordinator else ('Готов к запуску в отдельной панели' if multiple else str(Path(options[index]).parent).replace(str(Path.home()), '~', 1))
                 put(y + 1, 8, detail, colors[1], left_w - 10)
             hits.append((y, y + row_step - 1, index, pos))
         if not visible:
@@ -129,7 +181,10 @@ def menu(screen, title, options, multiple=False, project=None, coordinator=False
             rw = width - right_x - 2
             box(top, right_x, panel_h, rw, '✦ Подробности')
             detail_lines = []
-            if coordinator:
+            if sessions:
+                detail_lines = textwrap.wrap(options[visible[current]], max(10, rw - 6)) if visible else []
+                detail_lines += ['', 'Работает: подключение', 'к существующим панелям.', '', 'Остановлена: восстановление', 'сохранённой раскладки;', 'процессы агентов могли', 'завершиться.', '', 'Дата — сохранение раскладки.']
+            elif coordinator:
                 detail_lines = ['КООРДИНАТОР', options[visible[current]] if visible else '—', '', 'ПРОЕКТ', str(project or ''), '', 'Читает состояние Bridge,', 'принимает управление,', 'ведёт задачи и передаёт роль.', '', 'Действующий координатор', 'не будет заменён молча.']
             elif multiple:
                 detail_lines = ['ПРОЕКТ', Path(project).name if project else 'Выбранный проект', '', 'ТВОЯ КОМАНДА']
@@ -142,7 +197,7 @@ def menu(screen, title, options, multiple=False, project=None, coordinator=False
                 detail_lines += ['', 'Далее — выбор AI-агентов.']
             for n, text in enumerate(detail_lines[:panel_h - 3]):
                 put(top + 2 + n, right_x + 3, text, colors[1] if text.isupper() else 0, rw - 6)
-        button = '  🚀 Запустить Herdr  ' if coordinator else '  Продолжить →  '
+        button = '  Открыть →  ' if sessions else '  🚀 Запустить Herdr  ' if coordinator else '  Продолжить →  '
         by = height - 4
         bx = max(3, width - len(button) - 6)
         enabled = bool(selected) if multiple else bool(visible)
@@ -203,8 +258,13 @@ def menu(screen, title, options, multiple=False, project=None, coordinator=False
 
 
 def choose(screen, paths):
+    if not paths:
+        raise RuntimeError('Проекты не найдены. Укажи корневые папки в ~/.config/herdr-launcher/roots.txt (по одной на строку).')
     while True:
-        index = menu(screen, 'HERDR — выбери проект', [str(p) for p in paths])
+        try:
+            index = menu(screen, 'HERDR — выбери проект', [str(p) for p in paths])
+        except KeyboardInterrupt:
+            raise BackToSessions
         while True:
             try:
                 agents = menu(screen, 'HERDR — выбери агентов', [a[0] for a in AGENTS], True, project=paths[index])
@@ -237,6 +297,7 @@ def prepare_bridge(project, coordinator, session, agents):
               'Never steal a live lease or a handoff reserved for another agent; explain the conflict to the user. '
               'Keep the returned token private and heartbeat before expiry. '
               'Read project instructions, inspect actual files and existing processes, and record checkpoints. '
+              'Before each substantial step, after its result, and at least once per minute during long work, use progress --agent '+name+' --current CURRENT_TASK --done ACTUAL_COMPLETED --next NEXT_STEP --checks REAL_CHECKS --state working in Russian. This command loads the reporting capability internally and renews an active lease. Never extract tokens. Use --state blocked or done when appropriate; do not report invented progress. '
               'Before assigning work, read status revision and run reconcile --revision REV --evidence with actual checks. '
               'Before delegating, split the objective into non-overlapping roles and explicit file scopes; shared config/lockfiles are handled sequentially by one owner. Use allocate --plan FILE to validate the entire wave, then allocate --plan FILE --send to register and send it atomically at the reservation level. Use dispatch --title TITLE --assignee AGENT --resources FILES --session SESSION --pane PANE --instructions-file FILE for all executor work: it registers, reserves and delivers report instructions. Workers use worker-report independently. '
               'Other selected agents are available as executors in this Herdr session: '
@@ -255,6 +316,11 @@ def prepare_bridge(project, coordinator, session, agents):
 
 def finish_setup(payload):
     base, agents, panes = payload['base'], payload['agents'], payload['panes']
+    coordinator_delivered=[]
+    if payload.get('project'):
+        guard=Path(__file__).resolve().parent/'universal-bridge/permission_guard.py'
+        subprocess.Popen([sys.executable,str(guard),'--project',payload['project'],'--session',base[2]],
+            stdin=subprocess.DEVNULL,start_new_session=True)
     def start(item):
         (label, kind), pane = item
         try:
@@ -266,6 +332,7 @@ def finish_setup(payload):
             if kind == payload.get('coordinator'):
                 prompted = subprocess.run(base + ['agent', 'prompt', kind, payload['bootstrap']],
                     capture_output=True, text=True, timeout=15)
+                if not prompted.returncode:coordinator_delivered.append(True)
                 if prompted.returncode:
                     print('Coordinator prompt not delivered; instructions saved in project .agent-bridge: '+(prompted.stderr or prompted.stdout), flush=True)
                 subprocess.run(base + ['agent', 'focus', kind], capture_output=True, timeout=10)
@@ -273,6 +340,22 @@ def finish_setup(payload):
             print(label+': '+str(exc), flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as pool:
         list(pool.map(start, zip(agents, panes)))
+    if payload.get('project'):
+        script=Path(__file__).resolve().parent/'universal-bridge/bridge.py'
+        trusted=subprocess.run([sys.executable,str(script),'--project',payload['project'],
+            'trust-workspace','--session',base[2]],capture_output=True,text=True,timeout=45)
+        print('Workspace trust: '+(trusted.stdout or trusted.stderr),flush=True)
+        if payload.get('coordinator') and not coordinator_delivered:
+            # Trust confirmation may have unblocked startup; submit bootstrap once ready.
+            for attempt in range(10):
+                state=subprocess.run(base+['agent','get',payload['coordinator']],capture_output=True,text=True,timeout=5)
+                try:ready=json.loads(state.stdout)['result']['agent'].get('interactive_ready')
+                except (ValueError,KeyError,TypeError):ready=False
+                if ready:
+                    delivered=subprocess.run(base+['agent','prompt',payload['coordinator'],payload['bootstrap']],capture_output=True,text=True,timeout=10)
+                    print('Coordinator bootstrap after trust: '+('submitted' if delivered.returncode==0 else 'unconfirmed'),flush=True)
+                    break
+                time.sleep(.5)
     if payload.get('project'):
         script=Path(__file__).resolve().parent/'universal-bridge/bridge.py'
         try:
@@ -283,7 +366,7 @@ def finish_setup(payload):
             print('Bridge readiness unconfirmed: '+str(exc),flush=True)
     try:
         result = subprocess.run(base + ['plugin', 'pane', 'open', '--plugin', 'local.usage-monitor',
-            '--entrypoint', 'dashboard', '--placement', 'tab', '--no-focus'],
+            '--entrypoint', 'dashboard', '--placement', 'tab', '--no-focus']+(['--env','BRIDGE_PROJECT='+payload['project']] if payload.get('project') else []),
             capture_output=True, text=True, timeout=15)
         if result.returncode:
             print('Usage Monitor: '+(result.stderr or result.stdout), flush=True)
@@ -299,11 +382,11 @@ def finish_setup(payload):
             print('Bridge board: '+str(exc),flush=True)
 
 
-def bind_runtime(project, session, agents, panes):
+def bind_runtime(project, session, agents, panes, coordinator=None):
     script=Path(__file__).resolve().parent/'universal-bridge/bridge.py'
     mapping={('antigravity' if kind=='agy' else kind):pane for (_,kind),pane in zip(agents,panes)}
     result=subprocess.run([sys.executable,str(script),'--project',str(project),'register-session',
-        '--session',session,'--panes',json.dumps(mapping)],capture_output=True,text=True,timeout=15)
+        '--session',session,'--panes',json.dumps(mapping)]+(['--coordinator','antigravity' if coordinator=='agy' else coordinator] if coordinator else []),capture_output=True,text=True,timeout=15)
     if result.returncode:raise RuntimeError('Bridge runtime registration: '+(result.stderr or result.stdout))
     backup=subprocess.run([sys.executable,str(script),'--project',str(project),'backup'],capture_output=True,text=True,timeout=15)
     if backup.returncode:print('Bridge backup failed; inspect state before relying on recovery.',flush=True)
@@ -320,12 +403,22 @@ def main():
     if '--list-projects' in sys.argv:
         print('\n'.join(map(str, paths)))
         return
-    if not paths:
-        raise RuntimeError('Проекты не найдены. Укажи корневые папки в ~/.config/herdr-launcher/roots.txt (по одной на строку).')
-    project, agents, coordinator = curses.wrapper(choose, paths)
     executable = shutil.which('herdr')
     if not executable:
         raise RuntimeError('Herdr не найден. Установи: brew install herdr. Затем снова запусти herdr-start.')
+    try:
+        sessions = recent_sessions(executable)
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        # Do not silently create another session when discovery fails.
+        raise RuntimeError('Не удалось проверить последние сессии: ' + str(exc)) from exc
+    try:
+        choice = curses.wrapper(choose_launch, paths, sessions)
+    except BackToSessions:
+        raise KeyboardInterrupt
+    if isinstance(choice, str):
+        os.execv(executable, [executable, 'session', 'attach', choice])
+        return
+    project, agents, coordinator = choice
     # A unique session avoids mixing new panes with an existing running session.
     session = 'launch-' + time.strftime('%Y%m%d-%H%M%S') + '-' + str(os.getpid())
     bootstrap = prepare_bridge(project, coordinator, session, agents)
@@ -356,7 +449,7 @@ def main():
         result = call('pane', 'split', panes[(i - 1) // 2], '--direction',
                       'right' if i % 2 else 'down', '--no-focus', '--cwd', str(project))
         panes.append(result['result']['pane']['pane_id'])
-    bind_runtime(project, session, agents, panes)
+    bind_runtime(project, session, agents, panes, coordinator)
     # Attach immediately; slow agent readiness and optional plugins cannot block the TUI.
     payload = {'project': str(project), 'base': base, 'agents': agents, 'panes': panes, 'coordinator': coordinator, 'bootstrap': bootstrap}
     with (logdir / (session + '.setup.log')).open('a') as log:
