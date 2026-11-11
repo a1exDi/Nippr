@@ -31,6 +31,10 @@ def read_state(project):
             db.execute('BEGIN')
             lease=dict(db.execute('SELECT agent,expires,generation,target FROM lease WHERE id=1').fetchone())
             tasks=[dict(x) for x in db.execute('SELECT id,title,assignee,status,result,updated FROM tasks ORDER BY updated DESC')]
+            tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if {'task_evidence','task_checks','task_verifications','task_acceptances'}.issubset(tables):
+                from acceptance import summary
+                for task in tasks:task['evidence']=summary(db,task['id'])
             workers={x['task']:dict(x) for x in db.execute('SELECT task,pane,session,report_at FROM workers')}
             checkpoints=[dict(x) for x in db.execute("SELECT at,agent,kind,body FROM events WHERE kind IN ('checkpoint','handoff','operator-switch','worker-report') ORDER BY id DESC LIMIT 20")]
             reports={}
@@ -287,6 +291,12 @@ def board(screen,project):
                 for task in view['active']+view['completed']+view['cancelled']:
                     label={'running':'В работе','blocked':'Заблокировано','queued':'В очереди','review':'На проверке','done':'Завершено','cancelled':'Отменено'}.get(task['status'],task['status'])
                     rows.extend([(label+' — '+task['title'],True),('Результат / прогресс: '+(task['result'] or 'Отчёт ещё не получен'),False)])
+                    evidence=task.get('evidence',{})
+                    rows.append(('Артефактов: '+str(len(evidence.get('artifacts',[])))+' · Проверка: '+str((evidence.get('verification') or {}).get('status','не запускалась')),False))
+                    check=evidence.get('verification')
+                    if check and not check['current_submission']:rows.append(('Проверка относится к предыдущей сдаче или плану; требуется повторная проверка',False))
+                    accepted=evidence.get('acceptance')
+                    rows.append(('Приёмка записана: '+accepted['agent']+(' · прежний координатор' if not accepted['current_generation'] else '') if accepted else ('Старая запись done: приёмка не подтверждена' if task['status']=='done' else 'Приёмка координатором: ожидается'),False))
                     report=state.get('reports',{}).get(task['id'],{})
                     if report.get('next'):rows.append(('Дальше: '+report['next'],False))
                     worker=state['workers'].get(task['id'],{})

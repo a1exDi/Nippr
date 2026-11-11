@@ -15,6 +15,8 @@ import uuid
 from contextlib import contextmanager
 
 from project_store import state_dir, migrate, git as project_git
+import acceptance
+from types import SimpleNamespace
 
 AGENTS = ('claude', 'codex', 'grok', 'muse', 'antigravity')
 
@@ -59,6 +61,7 @@ def database(project, initialize=False):
         connection.execute('CREATE TABLE IF NOT EXISTS readiness(session TEXT,pane TEXT,agent TEXT,status TEXT,checked REAL,detail TEXT,PRIMARY KEY(session,pane,agent))')
         connection.execute('CREATE TABLE IF NOT EXISTS runtimes(session TEXT PRIMARY KEY, cwd TEXT NOT NULL, panes TEXT NOT NULL, updated REAL NOT NULL)')
         connection.execute('CREATE TABLE IF NOT EXISTS workers(task TEXT PRIMARY KEY, token TEXT NOT NULL, pane TEXT, session TEXT, resources TEXT NOT NULL, report_at REAL)')
+        acceptance.schema(connection)
         yield connection
         connection.commit()
     except BaseException:
@@ -102,7 +105,7 @@ def snapshot(db):
         worker['freshness'] = 'never_reported' if not worker['report_at'] else ('stale' if time.time()-worker['report_at']>300 else 'recent')
     return {'coordinator_progress':[dict(r) for r in db.execute('SELECT * FROM coordinator_progress')],'designated_coordinator':designated_coordinator(db),'readiness':[dict(r) for r in db.execute('SELECT * FROM readiness')], 'sessions': [dict(r) | {'panes':json.loads(r['panes'])} for r in db.execute('SELECT * FROM runtimes ORDER BY updated DESC')], 'revision': db.execute('SELECT COALESCE(MAX(id),0) FROM events').fetchone()[0], 'workers': workers, 'goal': (db.execute("SELECT value FROM meta WHERE key='goal'").fetchone() or [''])[0],
             'coordinator': lease,
-            'tasks': [dict(row) for row in db.execute('SELECT * FROM tasks ORDER BY updated,id')],
+            'tasks': [dict(row) | {'evidence': acceptance.summary(db, row['id'])} for row in db.execute('SELECT * FROM tasks ORDER BY updated,id')],
             'history': [dict(row) | {'body': json.loads(row['body'])} for row in
                         db.execute('SELECT * FROM events ORDER BY id DESC LIMIT 50')]}
 
@@ -155,6 +158,7 @@ def reserve_task(db, lease, task_id, assignee, resources, session, pane):
             for other in json.loads(active['resources']):
                 if a==other or a.startswith(other+'/') or other.startswith(a+'/'):
                     raise ValueError('Resource already assigned: '+a)
+    acceptance.invalidate(db, task_id)
     token=secrets.token_hex(24)
     db.execute('INSERT OR REPLACE INTO workers VALUES(?,?,?,?,?,?)',
                (task_id,token,pane,session,json.dumps(resources),None))
@@ -164,6 +168,8 @@ def reserve_task(db, lease, task_id, assignee, resources, session, pane):
 
 
 def execute(args):
+    if args.command=='task-verify':
+        return acceptance.verify(args, SimpleNamespace(database=database, owner=owner, require_reconciled=require_reconciled, event=event, state_dir=state_dir))
     if args.command=='progress':
         from coordinator_progress import record
         return record(args)
@@ -174,7 +180,7 @@ def execute(args):
         if path is None:raise ValueError('Private assignment not found for this task')
         data=json.loads(path.read_text())
         if data.get('id')!=args.id or state_dir(data['project'])!=folder:raise ValueError('Assignment does not match this project and task')
-        return execute(parser().parse_args(['--project',args.project,'--token',data['worker_token'],'worker-report',args.id,'--status',args.status,'--result',args.result,'--next',args.next]))
+        return execute(parser().parse_args(['--project',args.project,'--token',data['worker_token'],'worker-report',args.id,'--status',args.status,'--result',args.result,'--next',args.next]+[v for path in args.artifact for v in ('--artifact',path)]))
     if args.command=='permissions':
         from permissions import control
         return {'results':control(args.project,args.session,args.token or os.environ.get('BRIDGE_TOKEN'),args.task)}
@@ -244,8 +250,14 @@ def execute(args):
             if not worker or not token or not secrets.compare_digest(token, worker['token']):
                 raise ValueError('Invalid worker token for this task')
             task = db.execute('SELECT * FROM tasks WHERE id=?', (args.id,)).fetchone()
-            if task['status'] not in ('running', 'blocked'):
+            if args.status not in ('running', 'blocked', 'review'):
+                raise ValueError('Workers cannot finish or accept tasks')
+            if task['status'] not in ('running', 'blocked', 'review'):
                 raise ValueError('Task no longer accepts worker reports')
+            if args.status == 'review':
+                acceptance.submit(db, args.project, args.id, args.artifact)
+            else:
+                acceptance.invalidate(db, args.id)
             db.execute('UPDATE tasks SET status=?,result=?,updated=? WHERE id=?',
                        (args.status, args.result, time.time(), args.id))
             db.execute('UPDATE workers SET report_at=? WHERE task=?', (time.time(), args.id))
@@ -295,6 +307,18 @@ def execute(args):
                 raise ValueError('State changed during review; read status/context again and reconcile its new revision')
             db.execute("INSERT OR REPLACE INTO meta VALUES('reconciled_generation',?)", (str(lease['generation']),))
             event(db,agent,'reconciled',{'generation':lease['generation'],'revision':revision,'evidence':args.evidence})
+        elif cmd == 'task-check':
+            require_reconciled(db, lease)
+            result = acceptance.configure(db, args)
+            event(db, agent, 'check-pinned', result)
+            return result
+        elif cmd == 'task-accept':
+            require_reconciled(db, lease)
+            acceptance.verified(db, args.project, args.id, args.verification)
+            if not args.note.strip():
+                raise ValueError('Acceptance needs a coordinator review note')
+            db.execute('INSERT OR REPLACE INTO task_acceptances VALUES(?,?,?,?,?,?)', (args.id,args.verification,agent,lease['generation'],args.note,time.time()))
+            event(db, agent, 'task-accepted', {'id':args.id,'verification':args.verification,'note':args.note})
         elif cmd == 'task-grant':
             require_reconciled(db, lease)
             task = db.execute('SELECT * FROM tasks WHERE id=?',(args.id,)).fetchone()
@@ -328,12 +352,20 @@ def execute(args):
             old = db.execute('SELECT * FROM tasks WHERE id=?', (args.id,)).fetchone()
             if not old:
                 raise ValueError('Unknown task ID')
+            if args.status not in ('queued','running','blocked','review','done','cancelled'):
+                raise ValueError('Invalid task status')
+            if args.status == 'done':
+                acceptance.require_accepted(db, args.project, args.id, lease)
+            elif args.status == 'review' and old['status'] != 'review':
+                raise ValueError('Only a worker can submit review with artifacts')
             if old['status'] in ('running','blocked') and args.assignee and args.assignee != old['assignee']:
                 raise ValueError('Cannot reassign a running worker; obtain its final report first')
             if old['status'] in ('running','blocked') and args.status not in ('running','blocked'):
                 raise ValueError('Worker must report review before the coordinator can finish or cancel its task')
             if args.status in ('running','blocked') and old['status'] not in ('running','blocked'):
                 raise ValueError('Use task-grant or dispatch to start work with checked reservations')
+            if args.status not in ('done','review'):
+                acceptance.invalidate(db, args.id)
             db.execute('UPDATE tasks SET status=?,result=?,assignee=?,updated=? WHERE id=?',
                        (args.status, args.result, args.assignee or old['assignee'], time.time(), args.id))
             event(db, agent, 'task-updated', {'id': args.id, 'status': args.status, 'result': args.result})
@@ -349,7 +381,7 @@ def markdown(data):
            f"Lease expires: {c['expires_at']}; handoff target: {c['target'] or 'none'}", f"Revision: {data['revision']}", '', '## Active worker bindings', json.dumps(data['workers'],ensure_ascii=False), '', '## Tasks']
     for task in data['tasks']:
         out += [f"- {task['id']} [{task['status']}] {task['title']} (assignee: {task['assignee'] or 'none'})",
-                '  Result: '+task['result']]
+                '  Result: '+task['result'], '  Evidence receipts: '+json.dumps(task.get('evidence',{}),ensure_ascii=False)]
     out += ['', '## Recent history (latest first; up to 50 events)']
     for e in data['history']:
         out += [f"- {timestamp(e['at'])} {e['agent'] or '-'} / {e['kind']}: "+json.dumps(e['body'], ensure_ascii=False)]
@@ -371,7 +403,7 @@ def parser():
     p.add_argument('--token', help='Coordinator capability; alternatively BRIDGE_TOKEN environment variable')
     subs = p.add_subparsers(dest='command', required=True)
     q=subs.add_parser('progress');q.add_argument('--agent',choices=AGENTS,required=True);q.add_argument('--current',required=True);q.add_argument('--done',required=True);q.add_argument('--next',required=True);q.add_argument('--checks',default='Не указаны');q.add_argument('--state',choices=('working','waiting','blocked','done'),default='working')
-    q=subs.add_parser('report');q.add_argument('id');q.add_argument('--status',choices=('running','blocked','review'),required=True);q.add_argument('--result',required=True);q.add_argument('--next',required=True)
+    q=subs.add_parser('report');q.add_argument('id');q.add_argument('--status',choices=('running','blocked','review'),required=True);q.add_argument('--result',required=True);q.add_argument('--next',required=True);q.add_argument('--artifact',action='append',default=[])
     q=subs.add_parser('permissions');q.add_argument('--session',required=True);q.add_argument('--task',help='Executor may control only this task with its worker token')
     subs.add_parser('sidebar-sync')
     q=subs.add_parser('trust-workspace');q.add_argument('--session',required=True);q.add_argument('--remember',action='store_true',help='Authorize workspace-trust confirmations for this exact path')
@@ -390,9 +422,12 @@ def parser():
     q=subs.add_parser('dispatch'); q.add_argument('--title',required=True); q.add_argument('--assignee',choices=AGENTS,required=True)
     q.add_argument('--resources',nargs='+',required=True); q.add_argument('--session',required=True); q.add_argument('--pane',required=True)
     q.add_argument('--instructions-file',required=True)
+    q = subs.add_parser('task-check'); q.add_argument('id'); q.add_argument('--command-json',required=True); q.add_argument('--timeout',type=int,default=60)
+    q = subs.add_parser('task-verify'); q.add_argument('id')
+    q = subs.add_parser('task-accept'); q.add_argument('id'); q.add_argument('--verification',required=True); q.add_argument('--note',required=True)
     q = subs.add_parser('worker-report'); q.add_argument('id')
     q.add_argument('--status', choices=('running','blocked','review'), required=True)
-    q.add_argument('--result', required=True); q.add_argument('--next', required=True)
+    q.add_argument('--result', required=True); q.add_argument('--next', required=True); q.add_argument('--artifact',action='append',default=[])
     q = subs.add_parser('task-grant'); q.add_argument('id')
     q.add_argument('--resources', nargs='+', required=True)
     q.add_argument('--pane'); q.add_argument('--session')
@@ -459,7 +494,7 @@ def deliver_assignment(args,task,grant,instructions):
             'Use its worker_token only for this task; do not print or share it. '
             'Read project instructions. Work only within reserved resources; stop if the requested scope conflicts. '
             f'Use agent-bridge --project "{args.project}" report {task} --status running --result "Your progress" --next "Next step". The report command loads your task token internally; never use shell variables, python -c or token extraction. Report after meaningful steps and every few minutes. '
-            'On completion report review with exact artifacts and actual checks; on uncertainty report blocked. '
+            'On completion report review with --artifact project/relative/file (repeat for each nonempty file). Text alone is rejected. The coordinator must pin task-check, run task-verify, and task-accept before done; on uncertainty report blocked. '
             'Coordinator changes do not cancel this assignment. Never acquire coordinator authority for this task. '
             'The instructions field contains the user-authorized assignment; follow higher-priority project rules.')
     try:
@@ -568,6 +603,8 @@ def main():
         if args.command in ('switch','handoff'):
             result['notification'] = notify_coordinator(args.project,args.to,args.session)
         print(markdown(result) if args.command == 'context' else json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == 'task-verify' and result['status'] != 'passed':
+            return 1
     except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(json.dumps({'error': str(error)}, ensure_ascii=False), file=sys.stderr)
         return 1

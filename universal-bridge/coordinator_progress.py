@@ -61,6 +61,20 @@ def nudge(project,session,agents):
         if progress_at!=saved.get('progress_at'):saved['count']=0
         if time.time()-saved['at']<120:return 'throttled'
         if saved['count']>=3:return 'awaiting_report'
+        # Herdr can retain a working badge after the Codex connection has failed.
+        # Never append reminders to an unrecovered client or an existing reminder draft.
+        binary=shutil.which('herdr') or '/opt/homebrew/bin/herdr'
+        try:
+            screen=subprocess.run([binary,'--session',session,'agent','read',target['pane_id'],
+                '--source','visible'],capture_output=True,text=True,timeout=3)
+            if screen.returncode or not screen.stdout.strip():return 'surface_unconfirmed'
+            text=screen.stdout.lower()
+            if any(marker in text for marker in ('automatic reconnect','reconnect failed','connecting to the server')):
+                return 'connection_blocked'
+            if 'nippr progress reporting reminder' in text:return 'reminder_pending'
+            if (target.get('composer') or {}).get('state') in ('editing','nonempty','draft'):
+                return 'draft_pending'
+        except (OSError,subprocess.TimeoutExpired):return 'surface_unconfirmed'
         # Reserve reminder atomically before sending; another guard cannot duplicate it.
         db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(key,json.dumps({'at':time.time(),'count':saved['count']+1,'progress_at':progress_at})))
     script=Path(__file__).with_name('bridge.py')

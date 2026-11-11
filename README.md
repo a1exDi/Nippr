@@ -1,94 +1,200 @@
-# Nippr
+# Nippr 🧭 — надстройка над Herdr
 
-Nippr is a local coordination ledger for Claude Code, Codex, Grok, Muse Code and Antigravity.
-Any agent can coordinate; tasks and worker reports survive coordinator handoffs.
+**Nippr дополняет Herdr инструментами для совместной работы AI-агентов: запуск команды, распределение задач, две панели наблюдения и приёмка проверяемых результатов.**
 
-## Components
+**🇷🇺 Русский** | [🇬🇧 English](README.en.md)
 
-- `universal-bridge/bridge.py`: SQLite ledger, coordinator leases, checkpoints, scoped worker tokens, file reservations, atomic allocation plans, readiness checks and backups.
-- `herdr-launcher.py`: terminal project/team/coordinator picker and Herdr startup.
-- `usage-monitor/`: Herdr plugin with a quota dashboard and a live team board.
-- `tests/`: coordination, allocation, recovery, worktree, readiness and adapter tests.
+## 🎯 Для чего это нужно
 
-## Install
+Herdr предоставляет терминальную среду и сессии агентов. Nippr добавляет рабочий процесс вокруг них: выбрать проект и команду, назначить ответственного координатора, разделить работу по файлам, увидеть прогресс и квоты, передать управление и принять результат после проверки.
 
-Requires Python 3.9+ and Git on macOS or Linux. No third-party Python packages.
-Herdr and authenticated agent CLIs are required for terminal delivery and launchpad.
+Это удобно, когда несколько агентов работают над одним репозиторием, длительная задача переживает смену координатора или нужно отличить уверенный отчёт от реально проверенной работы. Поддерживаются роли **Claude Code, Codex, Grok, Muse Code и Antigravity**. Любой из них может быть координатором.
+
+## 🧩 Из каких модулей состоит Nippr
+
+| Модуль | Что делает | Зачем открывать |
+|---|---|---|
+| 🚀 Launchpad | Последние сессии, выбор проекта, состава команды и координатора, запуск Herdr | Начать или продолжить работу |
+| 🧭 Bridge Board — Live Team | Команда проекта, задачи, отчёты, активность координатора, контрольные точки и квитанции проверки | Понять, кто чем занят и что ждёт приёмки |
+| 📊 Usage Monitor | Доступные снимки квот, расхода токенов и контекста с источниками и временем | Оценить оставшуюся ёмкость агентов |
+| 🔗 Universal Bridge | Локальный журнал SQLite, право координации, назначения, резервирование файлов и приёмка | Управлять работой и сохранять её состояние |
+
+**Две панели — это Bridge Board и Usage Monitor.** Одна показывает работу команды, другая — использование ресурсов. Они не заменяют друг друга.
+
+## 🛠 Установка
+
+Нужны **Python 3.9+, Git, macOS или Linux**. Сторонние Python-библиотеки не требуются. Для запуска команды и доставки заданий отдельно установите Herdr и войдите в CLI нужных агентов. Плагин указывает минимальную версию Herdr **0.9.5**. Адаптеры и обнаружение проектов преимущественно проверялись на macOS.
 
 ```sh
 python3 install.py
-~/.local/bin/agent-bridge --help
-~/.local/bin/herdr-start
+agent-bridge --help
+herdr-start
 ```
 
-The installer creates commands in `~/.local/bin` without overwriting unrelated commands.
-It links the local Herdr plugin if Herdr is available. Keep this checkout in place.
-Provider support and default project discovery are primarily tested on macOS.
+Установщик создаёт четыре команды в `~/.local/bin` и подключает плагин, если Herdr доступен. Добавьте эту папку в `PATH` и сохраняйте исходную папку Nippr. Чужие существующие команды не перезаписываются. Если команда уже ведёт в другую копию Nippr, установщик оставляет её: проверьте путь, прежде чем считать новую версию установленной.
 
-## First project
+## 🚀 Запуск проекта и возвращение к сессии
+
+`herdr-start` сначала показывает до 20 последних сессий: проект, состояние сервера, время сохранения раскладки и ID. Поиск работает по этим полям. Enter подключает выбранную сессию без создания новой команды и без повторной отправки инструкций. «Новая сессия» открывает выбор проекта, агентов и координатора; Esc на выборе проекта возвращает к сессиям.
+
+«Сервер работает» не означает, что модель сейчас выполняет работу. Для остановленной сессии восстанавливается сохранённая раскладка; продолжение каждого процесса не гарантируется. Ошибка списка показывается явно и не запускает новую сессию автоматически.
 
 ```sh
-agent-bridge --project /path/to/project init --goal "Your approved objective"
-agent-bridge --project /path/to/project claim --agent codex
-agent-bridge --project /path/to/project status
+herdr-start --list-projects
 ```
 
-Claim returns a coordinator token. Pass it privately through `BRIDGE_TOKEN` or the
-global `--token` option before the subcommand. Read `context`, inspect actual files
-and processes, then `reconcile --revision REV --evidence "Checks performed"` before
-assigning work. See [the agent protocol](universal-bridge/AGENT_BRIDGE.md).
+Папки поиска проектов задаются в `~/.config/herdr-launcher/roots.txt`, по одной на строку.
 
-## Allocation and handoff
+## 🖥 Все команды для запуска и просмотра
 
-`allocate --plan FILE` validates a complete wave; `--send` commits reservations and
-delivers instructions. `dispatch` handles one task. One active assignment per pane;
-overlapping file/directory reservations are rejected. Workers independently send
-`worker-report` with running, blocked or review status. The coordinator validates
-results before marking done.
+| Команда | Что откроется / вернётся |
+|---|---|
+| `herdr-start` | Launchpad, последние сессии и запуск команды |
+| `herdr-start --list-projects` | Список найденных проектов |
+| `bridge-board --project /путь/к/проекту` | Живая панель команды в текущем терминале |
+| `bridge-board --project /путь/к/проекту --json` | Снимок команды и задач в JSON |
+| `herdr-usage` | Выбор работающей сессии и открытие панели квот |
+| `herdr-usage SESSION` | Панель квот в конкретной сессии |
+| `agent-bridge --project /путь/к/проекту status` | Статусы задач, координатор, назначения и квитанции проверки в JSON |
+| `agent-bridge --project /путь/к/проекту context` | Контекст продолжения работы в Markdown |
+| `agent-bridge --help` | Полный список подкоманд Bridge |
+| `agent-bridge COMMAND --help` | Все параметры конкретной подкоманды |
 
-`handoff` transfers ownership; `switch` is an explicit local operator override.
-`recover` works after the lease expires. Executors retain their tasks and scoped
-tokens across handoffs. A successor reconciles state before new assignments.
+Открытие панелей вкладками внутри Herdr:
 
-Herdr-bound grants require a successful readiness probe no older than five minutes:
-`health --session SESSION --probe`. Probes can consume a small amount of model quota.
+```sh
+herdr --session SESSION plugin pane open --plugin local.usage-monitor --entrypoint bridge --placement tab --focus --env BRIDGE_PROJECT=/path/to/project
+herdr --session SESSION plugin pane open --plugin local.usage-monitor --entrypoint dashboard --placement tab --focus
+```
 
-## Storage and backups
+Из исходной папки Nippr:
 
-For Git projects: `<git-common-dir>/agent-bridge/`, shared by all linked worktrees.
-For non-Git directories: `.agent-bridge/`. Use `where` to locate it. State contains
-private coordination and worker tokens; never commit or publish it.
-`backup` uses SQLite's consistent online backup API. Launchpad backs up at startup.
-`migrate --offline` relocates legacy ledgers only after all writers are stopped.
+```sh
+python3 usage-monitor/monitor.py --json
+python3 usage-monitor/monitor.py --refresh
+```
 
-## Validation
+Первая команда читает снимки использования, вторая явно обновляет данные провайдеров. В Usage Monitor клавиша **R** обновляет данные, **Q** закрывает панель. Отсутствующие значения означают «неизвестно», а не нулевой расход. Для квот Claude нужен отдельно настроенный statusline-коллектор; доступность остальных данных зависит от установленных CLI и форматов ответов сервисов.
+
+## 👥 Кто за что отвечает
+
+**Пользователь** определяет цель, границы и разрешения. **Координатор** владеет обновляемым правом управления — lease, по умолчанию на 900 секунд. Он назначает работу, выбирает проверки и принимает результаты. **Исполнители** получают отдельный доступ только к своей задаче и резервирование файлов. Они сообщают `running`, `blocked` или `review` и не могут самостоятельно принять задачу либо установить `done`.
+
+```text
+Очередь → назначение → работа / блокировка → review + файлы результата
+                                                ↓
+                                   координатор задаёт проверку
+                                                ↓
+                                   Bridge реально её выполняет
+                                                ↓
+                                 координатор изучает и принимает
+                                                ↓
+                                               done
+```
+
+Нельзя одновременно назначить пересекающиеся файлы активным задачам или занять одну панель двумя заданиями. Резервирование действует в протоколе Bridge и не блокирует файловую систему на уровне ОС.
+
+## ✅ Что теперь считается выполненной задачей
+
+1. Исполнитель прикладывает **существующий непустой файл** через `--artifact`. Можно указать несколько файлов. Все они должны входить в зарезервированные ресурсы задачи; папку результатов тоже нужно резервировать. Bridge фиксирует размер и SHA-256.
+2. Координатор задаёт проверку через `task-check`: массив аргументов команды и тайм-аут 1–300 секунд.
+3. `task-verify` действительно запускает эту команду, независимо от текстового отчёта исполнителя. Записываются stdout/stderr, код выхода, длительность и хеш отдельного приватного лога.
+4. Координатор читает артефакты, diff и реальный вывод проверки, затем выполняет `task-accept` с ID проверки и пояснением.
+5. Только после этого разрешён `task-update --status done`.
+
+Пример после создания и назначения задачи. `TASK` и `VERIFICATION_ID` заменяются полученными ID. Координатор использует приватно настроенный `BRIDGE_TOKEN`; `report` исполнителя загружает доступ из файла назначения самостоятельно.
+
+```sh
+agent-bridge --project /project report TASK --status review --artifact src/result.py --result "Результат готов к проверке" --next "Приёмка координатором"
+agent-bridge --project /project task-check TASK --command-json '["python3","-m","unittest","discover"]' --timeout 60
+agent-bridge --project /project task-verify TASK
+# Сначала изучить файлы, diff и настоящий лог проверки.
+agent-bridge --project /project task-accept TASK --verification VERIFICATION_ID --note "Проверены результат и вывод тестов"
+agent-bridge --project /project task-update TASK --status done --result "Результат принят"
+```
+
+Изменение файлов, лога, плана проверки или повторная сдача результата требует актуальной проверки и новой приёмки. При передаче управления преемник сверяет состояние и принимает результат заново. Можно принять только последнюю успешную проверку этой задачи. Неуспешный запуск, ненулевой код, тайм-аут или изменение артефакта во время проверки не позволяют закрыть задачу. Пока проверка выполняется, журнал не удерживает блокировку записи SQLite.
+
+Пути артефактов задаются относительно выбранной папки проекта. Симлинки, выход через `..`, внутренние файлы Git/Bridge и файлы окружения запрещены. Ссылка в интернете или написанный исполнителем отчёт «тесты прошли» не заменяют проверяемый локальный результат.
+
+**Граница гарантии:** Bridge подтверждает запуск выбранной команды над зафиксированной версией и запись приёмки координатором. Полноту списка файлов, достаточность тестов и смысловую корректность результата оценивает координатор. Это не изолированная ОС-песочница и не обязательная проверка третьей моделью. Старые записи `done` сохраняются как история без выдуманных квитанций. `progress --state done` описывает активность координатора и не закрывает задачу исполнителя.
+
+## 📚 Полный справочник подкоманд Bridge
+
+Глобальные `--project PATH` и приватный `--token` ставятся **до подкоманды**. Для координатора можно использовать `BRIDGE_TOKEN`. Не печатайте и не публикуйте значения доступа; не вставляйте их в отчёты или подсказки. Для доставленного задания предпочтительна команда `report`.
+
+| Подкоманда | Назначение и основные параметры |
+|---|---|
+| `init` | Инициализация: `--goal` |
+| `status` | Снимок состояния в JSON без значений доступа |
+| `context` | Контекст продолжения в Markdown |
+| `claim` | Занять свободную или зарезервированную роль: `--agent`, `--ttl` |
+| `recover` | Получить роль после истечения срока: `--agent`, `--reason` |
+| `reconcile` | Подтвердить изучение состояния: `--revision`, `--evidence` |
+| `heartbeat` | Продлить активный lease: `--ttl` |
+| `progress` | Активность координатора: `--agent`, `--current`, `--done`, `--next`, `--checks`, `--state` |
+| `checkpoint` | Контрольная точка: `--summary`, `--next`, `--checks`, `--limitations` |
+| `task-add` | Создать задачу: `--title`, `--assignee` |
+| `task-grant ID` | Назначить задачу из очереди: `--resources`, `--session`, `--pane` |
+| `dispatch` | Создать, зарезервировать и доставить: `--title`, `--assignee`, `--resources`, `--session`, `--pane`, `--instructions-file` |
+| `allocate` | Проверить план волны: `--plan FILE`; `--send` применяет и доставляет |
+| `report ID` | Отчёт с внутренней загрузкой доступа: `--status`, `--result`, `--next`, повторяемый `--artifact` |
+| `worker-report ID` | Низкоуровневый отчёт с отдельным доступом задачи; те же параметры отчёта |
+| `task-check ID` | Зафиксировать команду проверки: `--command-json`, `--timeout` |
+| `task-verify ID` | Реально выполнить проверку и вернуть ID, статус и квитанцию |
+| `task-accept ID` | Принять результат: `--verification`, `--note` |
+| `task-update ID` | Решение координатора: `--status`, `--result`, `--assignee`; для done нужна приёмка |
+| `handoff` | Передать и зарезервировать управление: `--to`, `--summary`, `--next`, `--ttl`, `--session` |
+| `switch` | Явное переключение оператором: `--to`, `--reason`, дополнительные проверки ожидаемого владельца/поколения |
+| `release` | Освободить роль: `--summary` |
+| `register-session` | Привязать сессию: `--session`, JSON `--panes`, `--coordinator` |
+| `health` | Готовность агентов: `--session`; `--probe` запрашивает короткий ответ модели и может расходовать квоту |
+| `permissions` | Обработка распознаваемых разрешений в заданной области: `--session`, `--task` |
+| `trust-workspace` | Явная обработка доверия папке: `--session`; `--remember` разрешает именно этот путь |
+| `sidebar-sync` | Обновить подписи зарегистрированных панелей |
+| `where` | Показать реальное расположение журнала |
+| `backup` | Создать согласованную резервную копию SQLite |
+| `migrate --offline` | Перенести старое хранилище после остановки всех писателей |
+
+Точные обязательные и необязательные параметры смотрите через `agent-bridge COMMAND --help`.
+
+## 🔄 Первое подключение координатора и передача работы
+
+```sh
+agent-bridge --project /project init --goal "Согласованная пользователем цель"
+agent-bridge --project /project claim --agent codex
+agent-bridge --project /project status
+agent-bridge --project /project context
+# Изучить файлы и процессы; приватно настроить полученный доступ.
+agent-bridge --project /project reconcile --revision REV --evidence "Что реально проверено"
+```
+
+Нельзя занять роль поверх живого владельца через `claim`. `handoff` отзывает старый доступ и по умолчанию резервирует преемника на 300 секунд. `recover` доступен после истечения срока; `switch` — явная операторская смена. Задания исполнителей сохраняются. После смены координатор обязан изучить состояние и выполнить `reconcile`; новые отчёты делают старый номер ревизии неактуальным.
+
+## 💾 Данные и резервные копии
+
+Для Git журнал хранится в `<git-common-dir>/agent-bridge/` и общий для связанных worktree. Для обычной папки — `.agent-bridge/`. Команда `where` показывает точный путь. Приватные данные включают права доступа, историю и логи проверок. Файлы назначения `.nippr-runtime/` тоже приватные. Ничего из этого нельзя публиковать вместе с проектом.
+
+`backup` использует согласованное онлайн-копирование SQLite; Launchpad также делает копию при запуске. Логи проверок лежат отдельными файлами: для сохранения пригодности квитанций нужно сохранять и их, одна копия SQLite их не включает. Не синхронизируйте живую SQLite между компьютерами как распределённую блокировку.
+
+## 🧪 Проверка разработки
 
 ```sh
 python3 tests/run.py
 ```
 
-Unit/integration fixtures cover the local control plane; provider calls are mocked
-where noted. An extended five-agent production workload and automatic crash recovery
-have not been validated. This project is experimental.
+Проверяются координация, назначения, передача, готовность, worktree, адаптеры панелей и приёмка. В тестах провайдеров реальные вызовы подменяются там, где это указано. Тесты приёмки запускают настоящие локальные процессы, включая ошибки, тайм-ауты и изменение файлов во время проверки. Длительная производственная нагрузка из пяти агентов и автоматическое восстановление после аварий не валидированы.
 
-## Boundaries
+Структура: `universal-bridge/` — протокол и журнал, `herdr-launcher.py` — запуск, `usage-monitor/` — обе панели, `tests/` — проверки, `install.py` — локальные команды.
 
-- File reservations constrain Bridge assignments, not OS filesystem access.
-- No automatic full-chat transfer, quota-triggered failover or reboot recovery.
-- Ledger data is only as current as agent reports; direct chat work is not intercepted.
-- Herdr delivery acknowledgment does not prove execution or completion.
-- Multiple hosts must not synchronize a live SQLite database as a distributed lock.
-- Quota adapters depend on installed CLI and service response formats.
-- Grok quota reading uses the existing local CLI credential in memory against its
-  billing endpoint; Codex uses its app server; Muse/Antigravity use their CLIs;
-  Claude quotas require an explicitly configured statusline collector.
-- Installation does not modify Claude settings or import browser credentials.
+## ⚠️ Ограничения
 
-No user task ledgers, account snapshots, credentials or diagnostic transcripts are
-included in this repository. No license has been selected yet.
+Автоматической передачи полного чата, переключения при исчерпании квот, восстановления после перезагрузки и публикации результатов нет. Незаписанная работа в чате не отслеживается. Lease не останавливает старые процессы. Названия агентов обозначают локальные роли, а не удостоверенную личность модели. Проверочные команды работают с правами текущего пользователя ОС.
 
-## Последние сессии Launchpad
+Установщик не изменяет настройки Claude и не импортирует учётные данные браузера. Для квот Grok существующие локальные данные CLI используются в памяти при обращении к billing endpoint; прочие адаптеры используют свои локальные интерфейсы.
 
-`herdr-start` сначала показывает до 20 последних сессий Herdr: проект, состояние сервера, дату сохранения раскладки и идентификатор. Поиск работает по всем этим полям. Enter открывает выбранную сессию через `herdr session attach`, без создания команды и без повторной отправки инструкций координатору. Пункт «＋ Новая сессия» открывает обычный выбор проекта и агентов; Esc на выборе проекта возвращает к сессиям.
+Проект экспериментальный. Пользовательские журналы, учётные данные и снимки аккаунтов в репозиторий не включены. Лицензия пока не выбрана.
 
-«Работает» означает работающий сервер Herdr, а не подтверждённую активность моделей. Для остановленной сессии Herdr восстанавливает сохранённую раскладку; продолжение каждого процесса агента не гарантируется. Ошибка получения списка показывается явно и не создаёт новую сессию автоматически.
+## 🔌 Сбой подключения Codex
+
+Если в панели Codex появляется `Automatic reconnect ...`, сначала проверьте `herdr --session SESSION status server`, затем `codex doctor --summary`. Живой сервер Herdr не доказывает соединение Codex с его app-server. Сохраните редактируемый черновик до выхода. Nippr не отправляет новые напоминания в панель с распознанной ошибкой переподключения, уже видимым напоминанием или неподтверждённой поверхностью. Полная автоматическая починка соединения Codex не реализована.

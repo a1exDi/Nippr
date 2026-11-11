@@ -19,7 +19,8 @@ Bridge works in any terminal with Python 3.9+; Herdr is optional.
 ## Work
 
 The CLI records coordination; it does not invoke AI, launch executors, edit source,
-verify tests, deploy, share chat histories, or monitor subscription limits automatically.
+deploy, share chat histories, or monitor subscription limits automatically.
+`task-verify` runs a coordinator-pinned validation command explicitly; it never trusts a worker claim that tests passed.
 Herdr notifications can deliver coordination-transfer requests, but do not prove acceptance.
 Agent adapters/terminal tools execute user-authorized work separately.
 
@@ -111,12 +112,12 @@ Executors must report after meaningful steps and at least every few minutes:
 
 ```text
 agent-bridge --project /project --token WORKER_TOKEN worker-report TASK_ID --status running --result "Progress, paths and checks" --next "Next action"
-agent-bridge --project /project --token WORKER_TOKEN worker-report TASK_ID --status review --result "Completed proposal and evidence" --next "Coordinator validation"
+agent-bridge --project /project --token WORKER_TOKEN worker-report TASK_ID --status review --artifact src/a.py --result "Completed proposal and evidence" --next "Coordinator validation"
 ```
 
 Reports remain valid across coordinator handoffs. The worker token cannot change
 any other task, the goal or ownership. Worker review is not coordinator validation.
-The coordinator records done after checking the result. Running/blocked tasks cannot
+The coordinator must pin a check, run independent verification, explicitly accept its receipt, then record done. See the mandatory acceptance protocol below. Running/blocked tasks cannot
 be reassigned or marked finished by the coordinator until the worker reports review.
 If a worker dies, do not erase its assignment to bypass reservations: inspect and
 resolve its processes explicitly; this version requires manual recovery of that case.
@@ -321,3 +322,39 @@ ambiguous processes are not prodded. Reminder attempts never update progress tim
 The coordinator must actually respond and record what it did; timers do not invent
 activity or completion. A stuck/offline/model-limited coordinator cannot be forced
 to produce a fresh report. The panel marks progress older than 90 seconds as stale.
+
+## Mandatory evidence and acceptance protocol
+
+1. Reserve both implementation and deliverable paths. A worker can submit only
+   nonempty regular files inside its reserved resources. Paths are relative to the
+   selected project directory; no symlinks, parent traversal or private Bridge files.
+2. Worker: `report TASK --status review --artifact src/a.py --result "Proposal" --next "Validate"`.
+   Repeat `--artifact` for every file needed to identify the complete deliverable.
+   `report` loads the assignment capability internally. No token extraction is needed.
+3. Coordinator: `task-check TASK --command-json '["python3","-m","unittest","discover"]' --timeout 60`.
+   This pins one argv array (no implicit shell) and a 1–300 second timeout. Use a
+   trusted check script for a suite of commands. Commands run in the selected project.
+4. Coordinator: `task-verify TASK`. Bridge actually runs the pinned command outside
+   the ledger write lock, captures stdout/stderr and exit code, and creates a private
+   log with a SHA-256 receipt. Nonzero exit, launch failure, timeout or changed
+   artifacts cannot produce an acceptable passing receipt.
+5. Inspect the artifacts, diff and actual check log, then run
+   `task-accept TASK --verification VERIFICATION_ID --note "What I inspected"`.
+6. Only then: `task-update TASK --status done --result "Accepted result"`.
+
+The check, submission and acceptance are version-bound. Resubmitting review,
+changing the check plan, returning to work or regranting invalidates acceptance.
+Artifact bytes and the verification log are rechecked at acceptance and completion.
+Only the latest verification for that task can be accepted. A successor coordinator
+must reconcile and accept again under its own lease generation.
+
+Old `done` rows are preserved as historical records, without fabricated receipts.
+A coordinator's `progress --state done` remains an activity report; it cannot close
+an executor task. Status/context expose evidence receipts; the team board shows
+artifact count, verification result and recorded acceptance separately.
+
+This is independent execution of coordinator-selected checks, not an independent
+security sandbox or a mandatory third model. The coordinator must assess whether
+the chosen checks cover the task; a zero-exit command alone does not establish
+correctness. All processes still have the local user's OS permissions. Remote URLs
+and worker-written test output alone do not substitute for a checked local artifact.

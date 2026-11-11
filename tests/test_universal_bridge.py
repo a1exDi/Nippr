@@ -26,7 +26,9 @@ class BridgeTests(unittest.TestCase):
  def test_handoff(self):
   a=self.call('claim','--agent','claude')['token']
   task=self.call('task-add','--title','Review','--assignee','codex',token=a)['id']
-  self.call('task-update',task,'--status','review','--result','Diff available',token=a)
+  Path(self.root,'review.txt').write_text('Proposal')
+  worker=self.call('task-grant',task,'--resources','review.txt',token=a)['worker_token']
+  self.call('worker-report',task,'--status','review','--artifact','review.txt','--result','Diff available','--next','Check',token=worker)
   self.call('handoff','--to','grok','--summary','Ready','--next','Check diff',token=a)
   with self.assertRaises(ValueError):self.call('heartbeat',token=a)
   with self.assertRaises(ValueError):self.call('claim','--agent','muse')
@@ -69,7 +71,12 @@ class BridgeTests(unittest.TestCase):
   with self.assertRaises(ValueError):self.call('task-grant',other,'--resources','src',token=new)
   with self.assertRaises(ValueError):self.call('task-update',task,'--status','cancelled','--result','Cancel',token=new)
   with self.assertRaises(ValueError):self.call('worker-report',other,'--status','review','--result','Fake','--next','x',token=worker)
-  self.call('worker-report',task,'--status','review','--result','Diff ready','--next','Validate',token=worker)
+  Path(self.root,'src').mkdir()
+  Path(self.root,'src/a.py').write_text('print(42)')
+  self.call('worker-report',task,'--status','review','--artifact','src/a.py','--result','Diff ready','--next','Validate',token=worker)
+  self.call('task-check',task,'--command-json',__import__('json').dumps([sys.executable,'src/a.py']),token=new)
+  checked=self.call('task-verify',task,token=new)
+  self.call('task-accept',task,'--verification',checked['verification'],'--note','Reviewed artifact and check',token=new)
   self.call('task-update',task,'--status','done','--result','Validated',token=new)
   self.call('task-grant',other,'--resources','src',token=new)
   state=self.call('status');self.assertNotIn(worker,str(state))
