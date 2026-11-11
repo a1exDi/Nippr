@@ -21,13 +21,56 @@ Use it when several agents work on one repository, when a long task outlives one
 
 Requires **Python 3.9+ and Git**, on macOS or Linux. No third-party Python packages. Install Herdr and authenticate the agent CLIs separately for launchpad and terminal delivery. The bundled plugin declares Herdr **0.9.5+**. Provider adapters and project discovery are primarily tested on macOS.
 
+**1. Keep the source checkout in a stable location.** For example, clone into `~/Projects/Nippr`:
+
+```sh
+mkdir -p "$HOME/Projects"
+git clone https://github.com/a1exDi/Nippr.git "$HOME/Projects/Nippr"
+cd "$HOME/Projects/Nippr"
+```
+
+If already downloaded, enter the checkout with `cd "/path/to/Nippr"`. Keep it in place after installation: the command wrappers and plugin link point to files inside it. If you move it, reconfigure the commands and plugin link for the new path; the installer preserves existing different wrappers instead of replacing them automatically.
+
+**2. Run the installer from the Nippr directory:**
+
 ```sh
 python3 install.py
+```
+
+The installer creates four commands in `~/.local/bin` and links the plugin when Herdr is available. Existing different commands are preserved. If an existing wrapper points to another checkout, inspect it before assuming this version was installed.
+
+**3. Add `~/.local/bin` to PATH.** For the current terminal window:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+To keep it for new terminal windows, add the line to your shell configuration **once**. For zsh, the default shell on macOS:
+
+```sh
+printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zshrc"
+source "$HOME/.zshrc"
+```
+
+For interactive bash instead:
+
+```sh
+printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.bashrc"
+source "$HOME/.bashrc"
+```
+
+Bash login shells may use `~/.bash_profile` instead of `~/.bashrc`; add the line there if needed. Open a new terminal and check the installation:
+
+```sh
+command -v agent-bridge
+command -v herdr-start
+command -v bridge-board
+command -v herdr-usage
 agent-bridge --help
 herdr-start
 ```
 
-The installer creates four commands in `~/.local/bin`, preserves unrelated existing commands, and links the plugin when Herdr is available. Keep this checkout in place and include `~/.local/bin` in `PATH`. If an existing wrapper points to another checkout, installation preserves it: inspect the wrapper before assuming it runs this version.
+`command -v` shows the resolved command path. If a command is missing, check PATH and the installer output. If it points to a different directory, inspect the matching wrapper in `~/.local/bin` and use the intended installed checkout.
 
 ## 🚀 Start and resume projects
 
